@@ -1,75 +1,124 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
     <style>
-        body { margin: 0; display: flex; justify-content: center; background: #f0f2f6; font-family: sans-serif; }
-        .grid { display: grid; gap: 10px; padding: 20px; background: white; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .node {
-            width: 40px; height: 40px; border-radius: 50%;
-            background: #d1d5db; border: 2px solid #9ca3af;
-            cursor: pointer; display: flex; align-items: center; justify-content: center;
-            font-size: 12px; color: #4b5563; user-select: none;
-            transition: all 0.2s;
+        /* قفل کردن استایل‌ها برای جلوگیری از تداخل با دارک مود */
+        body { 
+            margin: 0; padding: 0; 
+            background-color: #f0f2f6 !important; 
+            font-family: sans-serif;
+            display: flex; flex-direction: column; align-items: center;
         }
-        .node.active { background: #3b82f6; border-color: #2563eb; color: white; transform: scale(1.1); }
-        .controls { margin-top: 15px; text-align: center; }
-        button { padding: 8px 16px; background: #ef4444; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        .toolbar { 
+            margin: 15px 0; 
+            padding: 10px; 
+            background: white; 
+            border-radius: 8px; 
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            display: flex; gap: 10px;
+        }
+        button { 
+            padding: 8px 15px; cursor: pointer; border-radius: 5px; 
+            border: 1px solid #ccc; background: #fff; color: #333;
+            font-weight: bold; transition: all 0.2s;
+        }
+        button.active { 
+            background: #3b82f6 !important; color: white !important; 
+            border-color: #2563eb !important; 
+        }
+        #canvas-container {
+            border: 2px solid #ccc;
+            background-color: white !important; /* پس‌زمینه سفید اجباری */
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
     </style>
 </head>
 <body>
-    <div>
-        <div id="grid" class="grid"></div>
-        <div class="controls">
-            <button onclick="clearSelection()">پاک کردن انتخاب‌ها</button>
-        </div>
+    <div class="toolbar">
+        <button id="btn-rod" class="active" onclick="setMode('rod')">📍 گذاشتن میله</button>
+        <button id="btn-wire" onclick="setMode('wire')">📏 کشیدن تسمه</button>
+        <button onclick="clearCanvas()" style="color: #dc2626; border-color: #fca5a5;">🗑️ پاک کردن</button>
+    </div>
+    <div id="canvas-container">
+        <canvas id="c" width="700" height="400"></canvas>
     </div>
 
     <script>
-        let selectedNodes = [];
-        const cols = 4;
-        const rows = 4;
-        const gridElement = document.getElementById('grid');
-        
-        // ساخت شبکه
-        gridElement.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-        
-        for (let r = 0; r < rows; r++) {
-            for (let c = 0; c < cols; c++) {
-                const node = document.createElement('div');
-                node.className = 'node';
-                node.dataset.id = `${c},${r}`;
-                node.innerText = `${c+1},${r+1}`;
-                node.onclick = () => toggleNode(node);
-                gridElement.appendChild(node);
-            }
+        const canvas = new fabric.Canvas('c', { backgroundColor: '#ffffff' });
+        let mode = 'rod'; 
+        let isDrawingWire = false;
+        let currentLine = null;
+
+        const wireOptions = {
+            stroke: '#333333', strokeWidth: 3, selectable: false, evented: false
+        };
+
+        function setMode(newMode) {
+            mode = newMode;
+            document.getElementById('btn-rod').classList.remove('active');
+            document.getElementById('btn-wire').classList.remove('active');
+            document.getElementById(mode === 'rod' ? 'btn-rod' : 'btn-wire').classList.add('active');
+            canvas.selection = (mode === 'rod'); // در حالت سیم، انتخاب گروهی غیرفعال شود
         }
 
-        function toggleNode(node) {
-            const id = node.dataset.id;
-            if (selectedNodes.includes(id)) {
-                selectedNodes = selectedNodes.filter(n => n !== id);
-                node.classList.remove('active');
-            } else {
-                selectedNodes.push(id);
-                node.classList.add('active');
+        canvas.on('mouse:down', function(o) {
+            if (o.target) return; 
+            const pointer = canvas.getPointer(o.e);
+            
+            if (mode === 'rod') {
+                const circle = new fabric.Circle({
+                    left: pointer.x, top: pointer.y, radius: 6,
+                    fill: '#ef4444', stroke: '#b91c1c', strokeWidth: 2,
+                    originX: 'center', originY: 'center', selectable: true
+                });
+                canvas.add(circle);
+            } else if (mode === 'wire') {
+                isDrawingWire = true;
+                currentLine = new fabric.Line([pointer.x, pointer.y, pointer.x, pointer.y], wireOptions);
+                canvas.add(currentLine);
             }
-            // ارسال داده‌ها به Streamlit
+        });
+
+        canvas.on('mouse:move', function(o) {
+            if (!isDrawingWire || !currentLine) return;
+            const pointer = canvas.getPointer(o.e);
+            currentLine.set({ x2: pointer.x, y2: pointer.y });
+            canvas.renderAll();
+        });
+
+        canvas.on('mouse:up', function(o) {
+            isDrawingWire = false;
+            currentLine = null;
+        });
+
+        function clearCanvas() {
+            canvas.clear();
+            canvas.backgroundColor = '#ffffff';
+            canvas.renderAll();
+        }
+
+        // ارسال داده‌ها به Streamlit
+        setInterval(() => {
+            const objects = canvas.getObjects();
+            const data = objects.map(obj => {
+                if (obj.type === 'circle') {
+                    return { type: 'rod', x: obj.left, y: obj.top };
+                } else if (obj.type === 'line') {
+                    return { type: 'wire', x1: obj.x1, y1: obj.y1, x2: obj.x2, y2: obj.y2 };
+                }
+                return null;
+            }).filter(item => item !== null);
+
             window.parent.postMessage({
                 isStreamlitMessage: true,
                 type: "streamlit:setComponentValue",
-                value: selectedNodes
+                value: data
             }, "*");
-        }
-
-        function clearSelection() {
-            selectedNodes = [];
-            document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
-            window.parent.postMessage({
-                isStreamlitMessage: true,
-                type: "streamlit:setComponentValue",
-                value: selectedNodes
-            }, "*");
-        }
+        }, 500); 
     </script>
 </body>
 </html>
