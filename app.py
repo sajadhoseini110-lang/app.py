@@ -1,295 +1,333 @@
 """
-محاسبه‌گر مقاومت سیستم زمین
-  1) میله‌های عمودی موازی  - BS 7430 (روش ضریب λ، میدان دور)
-  2) ترکیب شبکه + میله     - معادلات Schwarz مطابق IEEE Std 80 (ضرایب k1,k2 به روش Sverak)
-
-محدودیت‌ها: خاک همگن، فرکانس قدرت (بدون اندوکتانس)، الکترود در تماس کامل با خاک.
-توجه: فرمول‌ها و ضرایب پیش از استفاده در پروژه باید با متن استاندارد تطبیق داده شوند.
+app.py - طراحی و تحلیل سیستم زمین (Streamlit)
+  تب ۱: تحلیل آرایش دلخواه میله‌ها (ویرایش مختصات، پیش‌تنظیم، CSV) + نقشه + توزیع جریان
+  تب ۲: مشاور طراحی: از داده‌های اولیه تا پیشنهاد آرایش، طول، جنس و مقطع
 """
 from __future__ import annotations
 
-import math
-
+import altair as alt
 import pandas as pd
 import streamlit as st
 
+import earthing_calc as ec
+from pattern_input import pattern_canvas
 
-class InputError(ValueError):
-    """ورودی نامعتبر یا خارج از دامنه اعتبار فرمول."""
-
-
-# ============================================================
-# محاسبات (توابع خالص، قابل تست)
-# ============================================================
-def single_rod_resistance(rho: float, length: float, diameter: float) -> float:
-    """مقاومت یک میله عمودی: R = rho/(2*pi*L) * (ln(8L/d) - 1).  d = قطر (m)."""
-    if rho <= 0 or length <= 0 or diameter <= 0:
-        raise InputError("ρ، طول و قطر میله باید مثبت باشند.")
-    if length <= diameter:
-        raise InputError("طول میله باید از قطر آن بزرگ‌تر باشد.")
-    return rho / (2 * math.pi * length) * (math.log(8 * length / diameter) - 1)
-
-
-def rod_positions(n: int, s: float, layout: str) -> list[tuple[float, float]]:
-    """مختصات میله‌ها: 'line' روی یک خط، 'ring' روی رئوس n‌ضلعی منتظم با ضلع s."""
-    if layout == "ring" and n >= 3:
-        radius = s / (2 * math.sin(math.pi / n))
-        return [
-            (radius * math.cos(2 * math.pi * i / n), radius * math.sin(2 * math.pi * i / n))
-            for i in range(n)
-        ]
-    return [(i * s, 0.0) for i in range(n)]
-
-
-def parallel_rods_resistance(
-    rho: float, length: float, diameter: float, n: int, s: float, layout: str = "line"
-) -> float:
+st.set_page_config(page_title="طراحی سیستم زمین", layout="wide")
+st.markdown(
     """
-    مقاومت n میله موازی (روش ضریب λ در BS 7430 به شکل کلی):
-        Rn = R/n + (1/n^2) * sum_{i!=j} rho/(2*pi*d_ij)
-    برای میله‌های هم‌فاصله روی خط، این رابطه دقیقاً همان Rn = (R/n)(1+λα) است با
-        λ = (2/n) * sum_{k=1}^{n-1} (n-k)/k      (n=2:1.00، 3:1.67، 4:2.17، 10:3.86)
-    مقاومت متقابل ρ/(2π d) برای d ≳ L معتبر است؛ برای d < L مقاومت متقابل بیش‌برآورد می‌شود.
-    """
-    r1 = single_rod_resistance(rho, length, diameter)
-    if n < 1:
-        raise InputError("تعداد میله باید حداقل ۱ باشد.")
-    if n == 1:
-        return r1
-    if s <= 0:
-        raise InputError("فاصله میله‌ها باید مثبت باشد.")
-    pts = rod_positions(n, s, layout)
-    inv_sum = 0.0
-    for i, (xi, yi) in enumerate(pts):
-        for j, (xj, yj) in enumerate(pts):
-            if i != j:
-                inv_sum += 1.0 / math.hypot(xi - xj, yi - yj)
-    return r1 / n + rho / (2 * math.pi) * inv_sum / n**2
-
-
-# ضرایب Sverak برای k1,k2 (x = نسبت طول به عرض شبکه)، سه عمق نسبی h/sqrt(A)
-_DEPTH_POINTS = (0.0, 0.1, 1 / 6)
-
-
-def _k_at(point: int, x: float) -> tuple[float, float]:
-    if point == 0:
-        return -0.04 * x + 1.41, 0.15 * x + 5.50
-    if point == 1:
-        return -0.05 * x + 1.20, 0.10 * x + 4.68
-    return -0.05 * x + 1.13, 0.10 * x + 4.40
-
-
-def schwarz_k_factors(x: float, h: float, area: float) -> tuple[float, float]:
-    """k1,k2 با درون‌یابی خطی بین سه منحنی عمق (0، √A/10، √A/6)؛ x = L/W ≥ 1."""
-    if x < 1 or h < 0 or area <= 0:
-        raise InputError("نسبت ابعاد باید ≥ ۱ و عمق ≥ ۰ و مساحت > ۰ باشد.")
-    r = min(h / math.sqrt(area), _DEPTH_POINTS[-1])
-    for idx in range(2):
-        lo, hi = _DEPTH_POINTS[idx], _DEPTH_POINTS[idx + 1]
-        if r <= hi:
-            t = (r - lo) / (hi - lo)
-            k1a, k2a = _k_at(idx, x)
-            k1b, k2b = _k_at(idx + 1, x)
-            return k1a + t * (k1b - k1a), k2a + t * (k2b - k2a)
-    return _k_at(2, x)
-
-
-def _positive(value: float, name: str) -> float:
-    if value is None or value <= 0:
-        raise InputError(f"جمله لگاریتمی {name} غیرمثبت شد؛ پارامترها خارج از دامنه فرمول‌اند.")
-    return value
-
-
-def schwarz_resistance(
-    rho: float,
-    grid_len: float,
-    grid_wid: float,
-    conductor_len: float,
-    depth: float,
-    conductor_dia: float,
-    n_rods: int,
-    rod_len: float,
-    rod_dia: float,
-) -> dict[str, float | None]:
-    """
-    معادلات Schwarz (IEEE Std 80):
-      R1 = ρ/(π Lc) [ln(2Lc/a') + k1 Lc/√A − k2],      a' = √(a·2h)
-      R2 = ρ/(2π n Lr) [ln(4Lr/b) − 1 + 2 k1 Lr/√A (√n − 1)^2]
-      Rm = ρ/(π Lc) [ln(2Lc/Lr) + k1 Lc/√A − k2 + 1]
-      Rg = (R1 R2 − Rm^2)/(R1 + R2 − 2 Rm)
-    a = شعاع هادی، b = شعاع میله. برای n=0 نتیجه Rg = R1 است.
-    """
-    if min(rho, grid_len, grid_wid, conductor_len, depth, conductor_dia) <= 0:
-        raise InputError("همه پارامترهای شبکه باید مثبت باشند.")
-    area = grid_len * grid_wid
-    sqrt_a = math.sqrt(area)
-    x = max(grid_len, grid_wid) / min(grid_len, grid_wid)
-    k1, k2 = schwarz_k_factors(x, depth, area)
-
-    a_eq = math.sqrt(conductor_dia / 2 * 2 * depth)
-    r1 = rho / (math.pi * conductor_len) * _positive(
-        math.log(2 * conductor_len / a_eq) + k1 * conductor_len / sqrt_a - k2, "R1"
-    )
-    if n_rods == 0:
-        return {"R1": r1, "R2": None, "Rm": None, "Rg": r1, "k1": k1, "k2": k2}
-
-    if rod_len <= 0 or rod_dia <= 0 or rod_len <= rod_dia:
-        raise InputError("طول/قطر میله نامعتبر است.")
-    b = rod_dia / 2
-    r2 = rho / (2 * math.pi * n_rods * rod_len) * _positive(
-        math.log(4 * rod_len / b) - 1
-        + 2 * k1 * rod_len / sqrt_a * (math.sqrt(n_rods) - 1) ** 2,
-        "R2",
-    )
-    rm = rho / (math.pi * conductor_len) * _positive(
-        math.log(2 * conductor_len / rod_len) + k1 * conductor_len / sqrt_a - k2 + 1, "Rm"
-    )
-    denom = r1 + r2 - 2 * rm
-    if denom <= 1e-9:
-        raise InputError("مخرج Rg غیرمثبت شد؛ پارامترها خارج از دامنه اعتبار روش Schwarz هستند.")
-    rg = (r1 * r2 - rm**2) / denom
-    if rg <= 0:
-        raise InputError("Rg غیرفیزیکی شد؛ هندسه ورودی را بازبینی کنید.")
-    return {"R1": r1, "R2": r2, "Rm": rm, "Rg": rg, "k1": k1, "k2": k2}
-
-
-# ============================================================
-# رابط کاربری
-# ============================================================
-RTL_CSS = """
 <style>
 [data-testid="stMarkdownContainer"], [data-testid="stCaptionContainer"],
-[data-testid="stAlert"], label, .stRadio { direction: rtl; text-align: right; }
-[data-testid="stLatex"], .katex { direction: ltr; }
+[data-testid="stAlert"], label { direction: rtl; text-align: right; }
+.katex, [data-testid="stLatex"] { direction: ltr; }
 </style>
-"""
+""",
+    unsafe_allow_html=True,
+)
+st.title("⚡ طراحی و تحلیل سیستم زمین")
 
-METHOD_BS = "BS 7430 (میله‌های موازی)"
-METHOD_SCH = "Schwarz / IEEE 80 (شبکه + میله)"
+# ------------------------------------------------------------
+# پارامترهای مشترک (سایدبار)
+# ------------------------------------------------------------
+with st.sidebar:
+    st.header("خاک و هدف")
+    rho_meas = st.number_input("مقاومت ویژه اندازه‌گیری‌شده ρ (Ω·m)", min_value=1.0, value=350.0, step=10.0)
+    season = st.number_input(
+        "ضریب فصلی/اطمینان", min_value=1.0, value=1.0, step=0.1,
+        help="برای طراحی در بدترین حالت (خاک خشک) ρ در این ضریب ضرب می‌شود. مقدار را با داده محلی تعیین کنید.",
+    )
+    rho = rho_meas * season
+    st.caption(f"ρ طراحی = {rho:.1f} Ω·m")
+    target = st.number_input("مقاومت هدف (Ω)", min_value=0.05, value=10.0, step=0.5)
+    st.header("میله")
+    rod_dia_mm = st.number_input("قطر میله (mm)", min_value=5.0, value=16.0, step=0.5)
+    rod_dia = rod_dia_mm / 1000.0
 
+tab_calc, tab_design, tab_help = st.tabs(["🧮 تحلیل آرایش دلخواه", "🧠 مشاور طراحی", "📘 راهنما و محدودیت‌ها"])
 
-def main() -> None:
-    st.set_page_config(page_title="طراحی سیستم زمین", layout="wide")
-    st.markdown(RTL_CSS, unsafe_allow_html=True)
-    st.title("⚡ محاسبه مقاومت سیستم زمین")
-    st.caption("BS 7430 (میله‌های موازی) | Schwarz / IEEE Std 80 (شبکه + میله)")
+# ============================================================
+# تب ۱ - تحلیل آرایش دلخواه
+# ============================================================
+with tab_calc:
+    if "layout_df" not in st.session_state:
+        st.session_state.layout_df = pd.DataFrame(ec.EXAMPLE_BOOK, columns=["x", "y"])
+        st.session_state.ver = 0
 
-    method = st.radio("روش محاسبه", [METHOD_BS, METHOD_SCH], horizontal=True)
+    rod_len = st.number_input("طول (عمق) هر میله L (m)", min_value=0.5, value=2.4, step=0.1)
 
-    with st.sidebar:
-        st.header("خاک و هدف")
-        rho = st.number_input("مقاومت ویژه ρ (Ω·m)", min_value=1.0, value=100.0, step=10.0)
-        target = st.number_input("مقاومت هدف (Ω)", min_value=0.1, value=10.0, step=0.5)
+    MODE_DRAW = "✋ ترسیم با لمس (مثل قفل صفحه)"
+    MODE_TABLE = "📋 جدول مختصات"
+    st.session_state.setdefault("canvas_pts", [])
+    st.session_state.setdefault("canvas_ver", 0)
 
-        st.header("میله‌های عمودی")
-        rod_len = st.number_input("طول میله L (m)", min_value=0.5, value=3.0, step=0.5)
-        rod_dia = st.number_input("قطر میله d (m)", min_value=0.005, value=0.016, step=0.001, format="%.3f")
+    def to_table(df_: pd.DataFrame) -> None:
+        st.session_state.layout_df = df_.copy()
+        st.session_state.ver += 1
+        st.session_state.input_mode = MODE_TABLE
 
-        if method == METHOD_BS:
-            n_rods = int(st.number_input("تعداد میله n", min_value=1, value=4, step=1))
-            spacing = st.number_input("فاصله بین میله‌ها s (m)", min_value=0.5, value=3.0, step=0.5)
-            layout_label = st.radio("چیدمان", ["روی یک خط", "حلقه (رئوس چندضلعی منتظم)"])
-            layout = "line" if layout_label == "روی یک خط" else "ring"
-        else:
-            n_rods = int(st.number_input("تعداد میله n (۰ = فقط شبکه)", min_value=0, value=4, step=1))
-            st.header("شبکه افقی")
-            grid_len = st.number_input("طول شبکه (m)", min_value=1.0, value=10.0, step=1.0)
-            grid_wid = st.number_input("عرض شبکه (m)", min_value=1.0, value=10.0, step=1.0)
-            cond_len = st.number_input("طول کل هادی Lc (m)", min_value=1.0, value=40.0, step=5.0)
-            depth = st.number_input("عمق دفن h (m)", min_value=0.1, value=0.6, step=0.1)
-            cond_dia = st.number_input(
-                "قطر هادی (m) - برای نوار، قطر معادل", min_value=0.005, value=0.01, step=0.001, format="%.3f"
-            )
+    st.subheader("۱) چیدمان میله‌ها")
+    mode = st.radio("روش ورود چیدمان", [MODE_DRAW, MODE_TABLE], horizontal=True, key="input_mode")
 
-    st.header("📊 نتایج")
-    notes: list[str] = []
-    try:
-        if method == METHOD_BS:
-            r_single = single_rod_resistance(rho, rod_len, rod_dia)
-            r_total = parallel_rods_resistance(rho, rod_len, rod_dia, n_rods, spacing, layout)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("یک میله", f"{r_single:.2f} Ω")
-            c2.metric(f"{n_rods} میله موازی", f"{r_total:.2f} Ω")
-            c3.metric("ضریب بهره‌وری η", f"{r_single / (n_rods * r_total):.2f}")
-            if n_rods > 1 and spacing < rod_len:
-                notes.append("s < L: اثر متقابل بیش‌برآورد می‌شود؛ برای بهره‌وری مناسب s ≥ L توصیه می‌شود.")
-            if rod_len / rod_dia < 20:
-                notes.append("نسبت L/d کمتر از ۲۰ است؛ دقت فرمول میله کاهش می‌یابد.")
-            result = r_total
+    if mode == MODE_DRAW:
+        g1, g2, g3 = st.columns(3)
+        cols_n = int(g1.number_input("ستون‌های نقطه", min_value=3, max_value=30, value=10, step=1))
+        rows_n = int(g2.number_input("ردیف‌های نقطه", min_value=3, max_value=30, value=8, step=1))
+        pitch = g3.number_input("فاصله بین نقاط (m)", min_value=0.1, value=2.0, step=0.5)
+        st.session_state.canvas_pts = [
+            p for p in st.session_state.canvas_pts if p[0] < cols_n and p[1] < rows_n
+        ]
+        val = pattern_canvas(
+            cols_n, rows_n, pitch, st.session_state.canvas_pts,
+            key=f"cv_{st.session_state.canvas_ver}_{cols_n}_{rows_n}",
+        )
+        if val and "points" in val:
+            st.session_state.canvas_pts = [list(map(int, p)) for p in val["points"]]
+        pts_df = pd.DataFrame(
+            [(i * pitch, j * pitch) for i, j in st.session_state.canvas_pts], columns=["x", "y"]
+        )
+        st.caption(
+            "روی نقطه‌ها بکشید یا لمس کنید تا میله اضافه شود؛ لمس یا کشیدن روی میله‌ی موجود آن را حذف می‌کند. "
+            "برای فاصله‌های غیرمضرب (مثلاً ۳٫۶ m) چیدمان را به جدول منتقل و عدد را اصلاح کنید."
+        )
+        st.button("انتقال به جدول برای ویرایش دقیق", on_click=to_table, args=(pts_df,))
+    else:
+        kind = st.selectbox(
+            "ساخت سریع چیدمان",
+            ["مثال کتاب (۹ میله)", "روی یک خط", "حلقه (چندضلعی منتظم)", "شبکه مستطیلی"],
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        n_in = rows_in = cols_in = 0
+        s_in = sx_in = sy_in = 0.0
+        if kind in ("روی یک خط", "حلقه (چندضلعی منتظم)"):
+            n_in = int(c1.number_input("تعداد میله", min_value=1, value=4, step=1))
+            s_in = c2.number_input("فاصله/ضلع (m)", min_value=0.1, value=3.0, step=0.5)
+        elif kind == "شبکه مستطیلی":
+            rows_in = int(c1.number_input("تعداد ردیف", min_value=1, value=3, step=1))
+            cols_in = int(c2.number_input("تعداد ستون", min_value=1, value=3, step=1))
+            sx_in = c3.number_input("فاصله افقی (m)", min_value=0.1, value=4.0, step=0.5)
+            sy_in = c4.number_input("فاصله عمودی (m)", min_value=0.1, value=4.0, step=0.5)
 
-            def sweep(k: int) -> float:
-                return parallel_rods_resistance(rho, rod_len, rod_dia, k, spacing, layout)
+        if st.button("ایجاد / جایگزینی چیدمان"):
+            if kind == "مثال کتاب (۹ میله)":
+                pts = ec.EXAMPLE_BOOK
+            elif kind == "روی یک خط":
+                pts = ec.layout_line(n_in, s_in)
+            elif kind == "حلقه (چندضلعی منتظم)":
+                pts = ec.layout_ring(n_in, s_in)
+            else:
+                pts = ec.layout_grid(rows_in, cols_in, sx_in, sy_in)
+            st.session_state.layout_df = pd.DataFrame(pts, columns=["x", "y"])
+            st.session_state.ver += 1
+            st.rerun()
 
-            sweep_range, sweep_label = range(1, 21), "تعداد میله"
-        else:
-            res = schwarz_resistance(
-                rho, grid_len, grid_wid, cond_len, depth, cond_dia, n_rods, rod_len, rod_dia
-            )
-            result = res["Rg"]
-            cols = st.columns(4)
-            cols[0].metric("R1 شبکه", f"{res['R1']:.2f} Ω")
-            cols[1].metric("R2 میله‌ها", "-" if res["R2"] is None else f"{res['R2']:.2f} Ω")
-            cols[2].metric("Rm متقابل", "-" if res["Rm"] is None else f"{res['Rm']:.2f} Ω")
-            cols[3].metric("Rg نهایی", f"{result:.2f} Ω")
-            st.caption(f"k1 = {res['k1']:.3f} ، k2 = {res['k2']:.3f}")
-            if depth / math.sqrt(grid_len * grid_wid) > 1 / 6:
-                notes.append("h/√A بیشتر از 1/6 است؛ ضرایب k1,k2 در حد منحنی عمق 1/6 نگه داشته شدند.")
-            if max(grid_len, grid_wid) / min(grid_len, grid_wid) > 8:
-                notes.append("نسبت ابعاد شبکه بیش از ۸ است؛ خارج از دامنه منحنی‌های k1,k2.")
-            if cond_len < 2 * (grid_len + grid_wid):
-                notes.append("Lc کمتر از محیط شبکه است؛ هندسه ورودی با شبکه بسته سازگار نیست.")
-
-            def sweep(k: int) -> float:
-                return schwarz_resistance(
-                    rho, grid_len, grid_wid, cond_len, depth, cond_dia, k, rod_len, rod_dia
-                )["Rg"]
-
-            sweep_range, sweep_label = range(0, 21), "تعداد میله"
-
-        if result <= target:
-            st.success(f"✅ {result:.2f} Ω ≤ هدف {target} Ω")
-        else:
-            st.error(f"❌ {result:.2f} Ω > هدف {target} Ω")
-        for note in notes:
-            st.warning("⚠️ " + note)
-
-        rows = []
-        for k in sweep_range:
+        uploaded = st.file_uploader("یا بارگذاری فایل CSV با ستون‌های x,y (متر)", type=["csv"])
+        if uploaded is not None and st.session_state.get("last_upload") != uploaded.file_id:
             try:
-                rows.append({sweep_label: k, "R (Ω)": sweep(k)})
-            except InputError:
-                continue
-        if rows:
-            st.subheader("حساسیت نسبت به تعداد میله")
-            st.line_chart(pd.DataFrame(rows).set_index(sweep_label))
+                df_up = pd.read_csv(uploaded)
+                df_up.columns = [str(c).strip().lower() for c in df_up.columns]
+                st.session_state.layout_df = df_up[["x", "y"]].astype(float)
+                st.session_state.ver += 1
+                st.session_state.last_upload = uploaded.file_id
+                st.rerun()
+            except Exception:
+                st.error("فایل CSV باید ستون‌های x و y (عددی) داشته باشد.")
 
-    except InputError as exc:
-        st.error(str(exc))
+        st.caption("جدول زیر قابل ویرایش است؛ مختصات هر میله را به متر وارد کنید (ردیف جدید با + اضافه می‌شود).")
+        edited = st.data_editor(
+            st.session_state.layout_df,
+            num_rows="dynamic",
+            key=f"editor_{st.session_state.ver}",
+            column_config={
+                "x": st.column_config.NumberColumn("x (m)", format="%.2f"),
+                "y": st.column_config.NumberColumn("y (m)", format="%.2f"),
+            },
+        )
+        pts_df = edited.dropna().astype(float).reset_index(drop=True)
 
-    with st.expander("فرمول‌ها"):
-        if method == METHOD_BS:
-            st.latex(r"R = \frac{\rho}{2\pi L}\left(\ln\frac{8L}{d}-1\right)")
-            st.latex(r"R_n = \frac{R}{n}(1+\lambda\alpha),\quad \alpha=\frac{\rho}{2\pi R s}")
-            st.latex(r"\lambda_{line} = \frac{2}{n}\sum_{k=1}^{n-1}\frac{n-k}{k}")
+    st.subheader("۲) نتیجه")
+    try:
+        if pts_df.empty:
+            raise ec.InputError("حداقل یک میله وارد کنید.")
+        res = ec.group_resistance(rho, rod_len, rod_dia, list(map(tuple, pts_df[["x", "y"]].values)))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("تعداد میله", res.n)
+        m2.metric("یک میله", f"{res.r_single:.2f} Ω")
+        m3.metric("مقاومت معادل مجموعه", f"{res.r_eq:.2f} Ω")
+        m4.metric("ضریب بهره‌وری η", f"{res.eta:.2f}")
+        if res.r_eq <= target:
+            st.success(f"✅ {res.r_eq:.2f} Ω ≤ هدف {target} Ω")
         else:
-            st.latex(r"R_1=\frac{\rho}{\pi L_c}\left[\ln\frac{2L_c}{a'}+k_1\frac{L_c}{\sqrt A}-k_2\right]")
-            st.latex(r"R_2=\frac{\rho}{2\pi n L_r}\left[\ln\frac{4L_r}{b}-1+\frac{2k_1L_r}{\sqrt A}(\sqrt n-1)^2\right]")
-            st.latex(r"R_m=\frac{\rho}{\pi L_c}\left[\ln\frac{2L_c}{L_r}+k_1\frac{L_c}{\sqrt A}-k_2+1\right]")
-            st.latex(r"R_g=\frac{R_1R_2-R_m^2}{R_1+R_2-2R_m}")
+            st.error(f"❌ {res.r_eq:.2f} Ω > هدف {target} Ω")
 
-    with st.expander("محدودیت‌ها و فرضیات"):
-        st.markdown(
-            "- خاک همگن (یک‌لایه)؛ برای خاک چندلایه نتیجه معتبر نیست.\n"
-            "- فرکانس قدرت و مقاومت خالص؛ اندوکتانس و رفتار گذرا (صاعقه) لحاظ نشده است.\n"
-            "- مقاومت متقابل میله‌ها به شکل میدان دور تقریب زده شده و برای s ≥ L دقیق‌تر است.\n"
-            "- ضرایب k1,k2 تقریب Sverak از منحنی‌های IEEE 80 هستند و برای نسبت ابعاد ۱ تا ۸ تعریف شده‌اند.\n"
-            "- نتیجه تحلیلی جایگزین اندازه‌گیری میدانی (روش افت پتانسیل) و تأیید طراحی نیست.\n"
-            "- پیش از استفاده در پروژه، فرمول‌ها و ضرایب با متن استاندارد تطبیق داده شوند."
+        if res.n > 1 and res.min_spacing < rod_len:
+            st.warning("⚠️ کمترین فاصله بین میله‌ها کمتر از طول میله است؛ بهره‌وری پایین می‌آید.")
+        st.caption(
+            f"مقایسه روش‌ها: هم‌پتانسیل (اصلی) {res.r_eq:.2f} Ω | میانگین با جریان برابر {res.r_avg:.2f} Ω | "
+            f"روش ساده BS 7430 (میدان دور) {res.r_simple:.2f} Ω"
         )
 
-    st.divider()
-    st.caption("مراجع: BS 7430:2011+A1:2015 | IEEE Std 80-2013")
+        plot = pts_df.copy()
+        plot["no"] = [str(i + 1) for i in range(len(plot))]
+        plot["share"] = res.shares * 100
+        xr = max(plot.x.max() - plot.x.min(), 1.0)
+        yr = max(plot.y.max() - plot.y.min(), 1.0)
+        height = int(min(420, max(180, 520 * yr / xr)))
+        base = alt.Chart(plot)
+        enc_x = alt.X("x:Q", title="x (m)", scale=alt.Scale(zero=False, nice=True, padding=25))
+        enc_y = alt.Y("y:Q", title="y (m)", scale=alt.Scale(zero=False, nice=True, padding=25))
+        points = base.mark_circle(size=260).encode(
+            x=enc_x, y=enc_y,
+            color=alt.Color("share:Q", title="سهم جریان (%)", scale=alt.Scale(scheme="orangered")),
+            tooltip=[alt.Tooltip("no:N", title="شماره"), alt.Tooltip("x:Q"), alt.Tooltip("y:Q"),
+                     alt.Tooltip("share:Q", title="سهم جریان %", format=".1f")],
+        )
+        labels = base.mark_text(dy=-16, fontSize=12).encode(x=enc_x, y=enc_y, text="no:N")
+        st.altair_chart((points + labels).properties(width="container", height=height))
 
+        table = plot[["no", "x", "y", "share"]].rename(
+            columns={"no": "شماره", "x": "x (m)", "y": "y (m)", "share": "سهم جریان (%)"})
+        st.dataframe(table.round(2), hide_index=True)
 
-if __name__ == "__main__":
-    main()
+        with st.expander("روش محاسبه"):
+            st.latex(r"R_{11}=\frac{\rho}{2\pi L}\left(\ln\frac{8L}{d}-1\right)")
+            st.latex(r"R_{ij}=\frac{\rho}{4\pi L^{2}}\iint\left[\frac{1}{\sqrt{s^2+(z-\zeta)^2}}+\frac{1}{\sqrt{s^2+(z+\zeta)^2}}\right]dz\,d\zeta")
+            st.latex(r"R_{eq}=\frac{1}{\mathbf 1^{T}Z^{-1}\mathbf 1}")
+            st.caption(
+                "میله‌ها هم‌پتانسیل در نظر گرفته می‌شوند و جریان هر میله از حل دستگاه Z·I=V به‌دست می‌آید؛ "
+                "به همین دلیل میله‌های کناری/گوشه سهم بیشتری از جریان دارند. اثر هادی افقی رابط در نتیجه "
+                "لحاظ نشده است (محافظه‌کارانه)."
+            )
+    except ec.InputError as exc:
+        st.error(str(exc))
+
+# ============================================================
+# تب ۲ - مشاور طراحی
+# ============================================================
+with tab_design:
+    st.subheader("داده‌های اولیه پروژه")
+    a1, a2, a3 = st.columns(3)
+    lx = a1.number_input("طول زمین در دسترس (m)", min_value=2.0, value=30.0, step=1.0)
+    ly = a2.number_input("عرض زمین در دسترس (m)", min_value=2.0, value=30.0, step=1.0)
+    max_len = a3.selectbox("حداکثر طول عملی میله (m)", [3.0, 4.5, 6.0, 9.0, 12.0], index=2)
+    b1, b2, b3 = st.columns(3)
+    fault_ka = b1.number_input("جریان خطای زمین عبوری از الکترود (kA)", min_value=0.1, value=10.0, step=0.5)
+    clear_t = b2.number_input("زمان قطع خطا (s)", min_value=0.05, value=1.0, step=0.05)
+    min_eta = b3.slider("حداقل ضریب بهره‌وری قابل قبول η", 0.3, 0.9, 0.5, 0.05)
+    c1, c2, c3 = st.columns(3)
+    soil_type = c1.selectbox("خورندگی خاک", ["معمولی", "خورنده (کلرید/سولفات بالا یا pH پایین)"])
+    steel_bonded = c2.checkbox("به آرماتور/سازه فولادی متصل می‌شود", value=True)
+    depth = c3.number_input("عمق دفن هادی افقی (m)", min_value=0.3, value=0.7, step=0.1)
+    d1, d2, d3 = st.columns(3)
+    material = d1.selectbox("جنس مورد بررسی برای مقطع", list(ec.MATERIAL_CONSTANTS))
+    theta_i = d2.number_input("دمای اولیه (°C)", value=30.0)
+    theta_f = d3.number_input("دمای نهایی مجاز (°C)", value=300.0,
+                              help="به نوع هادی و اتصال بستگی دارد؛ باید با استاندارد تأیید شود.")
+
+    lengths = tuple(v for v in ec.SEARCH_LENGTHS if v <= max_len)
+
+    @st.cache_data(show_spinner=False)
+    def cached_rods(rho_, d_, lx_, ly_, lengths_):
+        return ec.search_rod_layouts(rho_, d_, lx_, ly_, lengths_)
+
+    @st.cache_data(show_spinner=False)
+    def cached_grid(rho_, lx_, ly_, depth_, d_, lengths_):
+        return ec.search_grid_with_rods(rho_, lx_, ly_, depth_, 0.01, d_, lengths_)
+
+    st.subheader("نتایج مشاور")
+    st.markdown("**مقاومت یک میله به تفکیک طول** (ρ طراحی = %.0f Ω·m)" % rho)
+    single_rows = []
+    for length in lengths:
+        r1 = ec.rod_self_resistance(rho, length, rod_dia)
+        single_rows.append({"طول میله (m)": length, "مقاومت یک میله (Ω)": round(r1, 1),
+                            "حداقل تعداد در حالت ایده‌آل": int(-(-r1 // target))})
+    st.dataframe(pd.DataFrame(single_rows), hide_index=True)
+
+    rods_df = cached_rods(rho, rod_dia, lx, ly, lengths)
+    ok = rods_df[(rods_df.R <= target) & (rods_df.eta >= min_eta)].sort_values(["total_len", "R"])
+    best_option = None
+    st.markdown("**گزینه‌های فقط‌میله‌ای که هدف را برآورده می‌کنند** (مرتب بر اساس کمترین مجموع طول میله)")
+    if ok.empty:
+        st.warning("هیچ آرایش فقط‌میله‌ای در این زمین با شرایط داده‌شده به هدف نمی‌رسد. بهترین‌های موجود:")
+        show = rods_df.sort_values("R").head(5)
+    else:
+        show = ok.head(8)
+        best_option = ok.iloc[0]
+    st.dataframe(
+        show.rename(columns={"desc": "آرایش", "L": "طول میله (m)", "n": "تعداد", "R": "R (Ω)",
+                             "eta": "η", "total_len": "مجموع طول (m)", "s_over_L": "کمترین s/L"})
+        [["آرایش", "طول میله (m)", "تعداد", "R (Ω)", "η", "مجموع طول (m)", "کمترین s/L"]].round(2),
+        hide_index=True,
+    )
+
+    grid_df = cached_grid(rho, lx, ly, depth, rod_dia, lengths)
+    if not grid_df.empty:
+        st.markdown("**شبکه افقی + میله (Schwarz / IEEE 80)** — بهترین گزینه‌ها")
+        gshow = grid_df.sort_values("R").head(6).rename(
+            columns={"mesh": "تقسیمات هر ضلع", "Lc": "طول هادی (m)", "n": "تعداد میله",
+                     "L": "طول میله (m)", "R": "Rg (Ω)", "total_len": "مجموع طول (m)"})
+        st.dataframe(gshow.round(2), hide_index=True)
+        if (grid_df.R <= target).any():
+            cheapest = grid_df[grid_df.R <= target].sort_values("total_len").iloc[0]
+            st.info(f"کم‌هزینه‌ترین شبکه برآورنده هدف: {int(cheapest.mesh)} تقسیم، "
+                    f"{cheapest.Lc:.0f} m هادی، {int(cheapest.n)} میله {cheapest.L:g} m → {cheapest.R:.2f} Ω")
+
+    st.markdown("**مقطع هادی (اتصال کوتاه)**")
+    try:
+        i_a = fault_ka * 1000
+        s_main = ec.min_cross_section(i_a, clear_t, material, theta_i, theta_f)
+        n_for_share = int(best_option.n) if best_option is not None else 4
+        s_rod = ec.min_cross_section(i_a * min(1.0, 2.0 / n_for_share), clear_t, material, theta_i, theta_f)
+        import math
+        d_rod_min = math.sqrt(4 * s_rod / math.pi)
+        st.write(
+            f"حداقل مقطع الکتریکی هادی اصلی ({material}): **{s_main:.0f} mm²** | "
+            f"برای هر میله (با فرض سهم حدود دو برابر میانگین): {s_rod:.0f} mm² ≈ قطر {d_rod_min:.1f} mm"
+        )
+        st.caption("حداقل ابعاد مکانیکی و ضخامت خوردگی را باید جداگانه از IEC/BS EN 62561-2 و BS 7430 لحاظ کنید؛ "
+                   "معمولاً عامل تعیین‌کننده قطر میله همین‌هاست، نه جریان.")
+    except ec.InputError as exc:
+        st.error(str(exc))
+
+    if best_option is not None:
+        gpr = fault_ka * 1000 * best_option.R
+        st.write(f"ولتاژ بالارفتن پتانسیل زمین (GPR) تقریبی با بهترین گزینه: **{gpr / 1000:.2f} kV** "
+                 "(ولتاژ تماس/گام باید جداگانه طبق BS EN 50522 / IEEE 80 بررسی شود).")
+
+    st.subheader("پیشنهادهای مهندسی")
+    notes: list[str] = []
+    if rho > 300:
+        notes.append("خاک پرمقاومت است؛ پیش از هر چیز اندازه‌گیری چندلایه (Wenner) انجام شود. اگر لایه عمیق‌تر "
+                     "مقاومت کمتری دارد، میله‌های عمیق‌تر (چندتکه‌ای با کوپلینگ) بسیار مؤثرتر از افزایش تعداد میله‌اند.")
+    if ok.empty:
+        notes.append("برای رسیدن به هدف: میله‌های بلندتر، شبکه افقی بزرگ‌تر، اتصال به الکترود دور یا الکترودهای "
+                     "طبیعی (پی/آرماتور)، و در نهایت بهبود خاک (بنتونیت/GEM) را بررسی کنید.")
+    else:
+        notes.append("برای کاهش هزینه معمولاً میله‌های بلندتر و کم‌تعدادتر از تعداد زیاد میله کوتاه کارآمدتر است؛ "
+                     "فاصله میله‌ها را ≥ طول میله بگیرید.")
+    if soil_type != "معمولی":
+        notes.append("خاک خورنده: مس‌اندود/استیل ضدزنگ یا مس را ترجیح دهید و ضخامت خوردگی را افزایش دهید.")
+    if steel_bonded and material == "مس":
+        notes.append("اتصال مس برهنه به فولاد/آرماتور دفن‌شده خوردگی گالوانیک ایجاد می‌کند؛ یا فولاد گالوانیزه "
+                     "هم‌جنس یا جداسازی/حفاظت کاتدی را در نظر بگیرید.")
+    if lx * ly < 400:
+        notes.append("زمین کوچک است؛ افزایش تعداد میله در فضای محدود بهره‌وری را سریع کم می‌کند.")
+    notes.append("مقدار نهایی باید با اندازه‌گیری میدانی (روش افت پتانسیل) تأیید و در بدترین فصل بازبینی شود.")
+    for n_ in notes:
+        st.write("• " + n_)
+
+# ============================================================
+# تب ۳ - راهنما
+# ============================================================
+with tab_help:
+    st.markdown(
+        """
+**محدودیت‌ها**
+- خاک همگن یک‌لایه؛ فرکانس قدرت؛ بدون اثر اندوکتانس و رفتار گذرا.
+- میله‌ها هم‌طول، هم‌قطر و عمودی که از سطح خاک شروع می‌شوند.
+- اثر هادی افقی بین میله‌ها در تب ۱ لحاظ نمی‌شود؛ برای آن از تب مشاور (Schwarz) استفاده کنید.
+- ضرایب k1 و k2 در روش Schwarz تقریب Sverak از منحنی‌های IEEE 80 هستند (نسبت ابعاد ۱ تا ۸).
+- مقطع هادی با روش آدیاباتیک IEC 60949 محاسبه می‌شود؛ ثابت‌های K و β و دمای نهایی باید با استاندارد تأیید شوند.
+- این برنامه جایگزین مطالعه ولتاژ تماس/گام و اندازه‌گیری میدانی نیست.
+
+**مراجع:** BS 7430:2011+A1:2015 | IEEE Std 80-2013 | IEC 60949 | BS EN 50522 | IEC 62561-2
+"""
+    )
