@@ -1,182 +1,75 @@
 <!DOCTYPE html>
-<html lang="fa">
+<html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  html, body { margin: 0; padding: 0; font-family: sans-serif; background: transparent; }
-  #bar { display: flex; gap: 8px; align-items: center; padding: 2px 0 8px 0; direction: rtl; }
-  button { font: inherit; font-size: 14px; padding: 6px 12px; border-radius: 8px; cursor: pointer;
-           border: 1px solid #8884; background: #8881; color: inherit; }
-  #count { font-size: 14px; margin-right: auto; }
-  canvas { display: block; touch-action: none; border-radius: 12px; }
-</style>
+    <style>
+        body { margin: 0; display: flex; justify-content: center; background: #f0f2f6; font-family: sans-serif; }
+        .grid { display: grid; gap: 10px; padding: 20px; background: white; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .node {
+            width: 40px; height: 40px; border-radius: 50%;
+            background: #d1d5db; border: 2px solid #9ca3af;
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+            font-size: 12px; color: #4b5563; user-select: none;
+            transition: all 0.2s;
+        }
+        .node.active { background: #3b82f6; border-color: #2563eb; color: white; transform: scale(1.1); }
+        .controls { margin-top: 15px; text-align: center; }
+        button { padding: 8px 16px; background: #ef4444; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    </style>
 </head>
 <body>
-<div id="bar">
-  <button id="undo">↩️ بازگشت</button>
-  <button id="clear">🗑️ پاک‌کردن</button>
-  <span id="count"></span>
-</div>
-<canvas id="cv"></canvas>
-<script>
-const send = (type, data) =>
-  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data), "*");
+    <div>
+        <div id="grid" class="grid"></div>
+        <div class="controls">
+            <button onclick="clearSelection()">پاک کردن انتخاب‌ها</button>
+        </div>
+    </div>
 
-const cv = document.getElementById("cv");
-const ctx = cv.getContext("2d");
-const bar = document.getElementById("bar");
-const countEl = document.getElementById("count");
-const M = { l: 36, r: 10, t: 10, b: 22 };
+    <script>
+        let selectedNodes = [];
+        const cols = 4;
+        const rows = 4;
+        const gridElement = document.getElementById('grid');
+        
+        // ساخت شبکه
+        gridElement.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const node = document.createElement('div');
+                node.className = 'node';
+                node.dataset.id = `${c},${r}`;
+                node.innerText = `${c+1},${r+1}`;
+                node.onclick = () => toggleNode(node);
+                gridElement.appendChild(node);
+            }
+        }
 
-let cols = 10, rows = 8, pitch = 2, theme = {};
-let sel = new Set(), hist = [], initialized = false;
-let cell = 30, dragging = false, mode = "add", path = [], last = null, cur = null;
-let snapshot = [], changed = false;
+        function toggleNode(node) {
+            const id = node.dataset.id;
+            if (selectedNodes.includes(id)) {
+                selectedNodes = selectedNodes.filter(n => n !== id);
+                node.classList.remove('active');
+            } else {
+                selectedNodes.push(id);
+                node.classList.add('active');
+            }
+            // ارسال داده‌ها به Streamlit
+            window.parent.postMessage({
+                isStreamlitMessage: true,
+                type: "streamlit:setComponentValue",
+                value: selectedNodes
+            }, "*");
+        }
 
-const key = (i, j) => i + "," + j;
-const color = (name, fallback) => theme[name] || fallback;
-
-function layout() {
-  const W = Math.max(document.body.clientWidth, 200);
-  cell = (W - M.l - M.r) / cols;
-  const H = M.t + M.b + rows * cell;
-  const dpr = window.devicePixelRatio || 1;
-  cv.style.width = W + "px";
-  cv.style.height = H + "px";
-  cv.width = Math.round(W * dpr);
-  cv.height = Math.round(H * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  send("streamlit:setFrameHeight", { height: Math.ceil(H + bar.offsetHeight + 12) });
-  draw();
-}
-
-function cx(i) { return M.l + (i + 0.5) * cell; }
-function cy(j) { return M.t + (rows - 1 - j + 0.5) * cell; }
-
-function draw() {
-  const W = cv.clientWidth, H = cv.clientHeight;
-  const primary = color("primaryColor", "#ff4b4b");
-  const text = color("textColor", "#31333f");
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = color("secondaryBackgroundColor", "#f0f2f6");
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.fillStyle = text; ctx.globalAlpha = 0.65;
-  ctx.font = "11px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
-  const step = Math.max(1, Math.ceil(34 / cell));
-  for (let i = 0; i < cols; i += step) ctx.fillText(String(+(i * pitch).toFixed(2)), cx(i), H - M.b + 5);
-  ctx.textAlign = "right"; ctx.textBaseline = "middle";
-  for (let j = 0; j < rows; j += step) ctx.fillText(String(+(j * pitch).toFixed(2)), M.l - 8, cy(j));
-  ctx.globalAlpha = 1;
-
-  for (let i = 0; i < cols; i++) {
-    for (let j = 0; j < rows; j++) {
-      const on = sel.has(key(i, j));
-      ctx.beginPath();
-      ctx.arc(cx(i), cy(j), on ? cell * 0.26 : cell * 0.1, 0, 2 * Math.PI);
-      ctx.fillStyle = on ? primary : text;
-      ctx.globalAlpha = on ? 1 : 0.35;
-      ctx.fill();
-      if (on) {
-        ctx.globalAlpha = 1; ctx.strokeStyle = "#fff"; ctx.lineWidth = Math.max(1.5, cell * 0.05);
-        const d = cell * 0.11;
-        ctx.beginPath();
-        ctx.moveTo(cx(i) - d, cy(j) - d); ctx.lineTo(cx(i) + d, cy(j) + d);
-        ctx.moveTo(cx(i) + d, cy(j) - d); ctx.lineTo(cx(i) - d, cy(j) + d);
-        ctx.stroke();
-      }
-    }
-  }
-  ctx.globalAlpha = 1;
-
-  if (dragging && path.length) {
-    ctx.beginPath();
-    ctx.moveTo(cx(path[0][0]), cy(path[0][1]));
-    for (let k = 1; k < path.length; k++) ctx.lineTo(cx(path[k][0]), cy(path[k][1]));
-    if (cur) ctx.lineTo(cur[0], cur[1]);
-    ctx.strokeStyle = mode === "add" ? primary : "#888";
-    ctx.globalAlpha = 0.45; ctx.lineWidth = cell * 0.14; ctx.lineCap = "round"; ctx.lineJoin = "round";
-    ctx.stroke(); ctx.globalAlpha = 1;
-  }
-  countEl.textContent = sel.size + " الکترود";
-}
-
-function cellAt(x, y) {
-  const i = Math.round((x - M.l) / cell - 0.5);
-  const jr = Math.round((y - M.t) / cell - 0.5);
-  const j = rows - 1 - jr;
-  if (i < 0 || i >= cols || j < 0 || j >= rows) return null;
-  if (Math.hypot(x - cx(i), y - cy(j)) > 0.65 * cell) return null;
-  return [i, j];
-}
-
-function pos(e) {
-  const r = cv.getBoundingClientRect();
-  return [e.clientX - r.left, e.clientY - r.top];
-}
-
-function applyAt(x, y) {
-  const c = cellAt(x, y);
-  if (!c) return;
-  if (!last || last[0] !== c[0] || last[1] !== c[1]) { path.push(c); last = c; }
-  const k = key(c[0], c[1]);
-  if (mode === "add" && !sel.has(k)) { sel.add(k); changed = true; }
-  if (mode === "remove" && sel.has(k)) { sel.delete(k); changed = true; }
-}
-
-function emit() {
-  const points = [...sel].map(k => k.split(",").map(Number)).sort((a, b) => a[1] - b[1] || a[0] - b[0]);
-  send("streamlit:setComponentValue", { value: { points }, dataType: "json" });
-}
-
-cv.addEventListener("pointerdown", e => {
-  e.preventDefault();
-  cv.setPointerCapture(e.pointerId);
-  dragging = true; path = []; last = null; changed = false;
-  snapshot = [...sel];
-  const [x, y] = pos(e); cur = [x, y];
-  const c = cellAt(x, y);
-  mode = c && sel.has(key(c[0], c[1])) ? "remove" : "add";
-  applyAt(x, y); draw();
-});
-cv.addEventListener("pointermove", e => {
-  if (!dragging) return;
-  const [x, y] = pos(e); cur = [x, y];
-  applyAt(x, y); draw();
-});
-function endDrag() {
-  if (!dragging) return;
-  dragging = false; path = []; cur = null;
-  if (changed) { hist.push(snapshot); emit(); }
-  draw();
-}
-cv.addEventListener("pointerup", endDrag);
-cv.addEventListener("pointercancel", endDrag);
-
-document.getElementById("undo").addEventListener("click", () => {
-  if (!hist.length) return;
-  sel = new Set(hist.pop()); emit(); draw();
-});
-document.getElementById("clear").addEventListener("click", () => {
-  if (!sel.size) return;
-  hist.push([...sel]); sel = new Set(); emit(); draw();
-});
-
-window.addEventListener("message", e => {
-  const d = e.data;
-  if (!d || d.type !== "streamlit:render") return;
-  const a = d.args || {};
-  theme = d.theme || {};
-  cols = a.cols; rows = a.rows; pitch = a.pitch;
-  if (!initialized) {
-    sel = new Set((a.points || []).filter(p => p[0] < cols && p[1] < rows).map(p => key(p[0], p[1])));
-    initialized = true;
-  }
-  layout();
-});
-window.addEventListener("resize", layout);
-send("streamlit:componentReady", { apiVersion: 1 });
-</script>
+        function clearSelection() {
+            selectedNodes = [];
+            document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
+            window.parent.postMessage({
+                isStreamlitMessage: true,
+                type: "streamlit:setComponentValue",
+                value: selectedNodes
+            }, "*");
+        }
+    </script>
 </body>
 </html>
