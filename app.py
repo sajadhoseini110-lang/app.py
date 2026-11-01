@@ -1,95 +1,106 @@
 import streamlit as st
 import math
-from earthing_calc import calculate_equivalent_resistance
+from pattern_input import pattern_canvas
 
-st.set_page_config(page_title="طراحی زمین", layout="wide")
+st.set_page_config(page_title="طراحی زمین - استاندارد BS 7430", layout="wide")
 
-st.title("⚡ محاسبه‌گر مقاومت زمین")
-st.markdown("با کلیک روی دکمه‌ها، آرایش الکترودهای خود را روی شبکه انتخاب کنید.")
+st.title("⚡ محاسبه‌گر دقیق مقاومت زمین")
+st.markdown("ترسیم آرایش الکترودها (مشابه مثال‌های استاندارد BS 7430)")
 
 # ================= سایدبار =================
 with st.sidebar:
-    st.header("تنظیمات خاک و الکترود")
-    rho = st.number_input("مقاومت ویژه خاک ρ (Ω·m)", value=100.0, step=10.0)
-    
-    st.subheader("میله‌های عمودی")
-    rod_L = st.number_input("طول میله L (m)", value=3.0, step=0.5)
+    st.header("۱. پارامترهای خاک و میله")
+    rho = st.number_input("مقاومت ویژه خاک ρ (Ω·m)", value=350.0, step=10.0)
+    rod_L = st.number_input("عمق میله L (m)", value=2.4, step=0.1)
     rod_d = st.number_input("قطر میله d (m)", value=0.016, step=0.001, format="%.3f")
     
-    st.subheader("نوار اتصال افقی (اختیاری)")
-    use_strip = st.checkbox("افزودن نوار افقی")
-    if use_strip:
-        strip_L = st.number_input("طول کل نوار (m)", value=20.0)
-        strip_w = st.number_input("عرض نوار (m)", value=0.04, step=0.01)
+    st.header("۲. تنظیمات مقیاس")
+    st.info("برای تبدیل پیکسل به متر، تعداد پیکسل‌های معادل ۱ متر را وارد کنید.")
+    pixels_per_meter = st.number_input("مقیاس (پیکسل در هر ۱ متر)", value=50.0, min_value=10.0, step=10.0)
+
+# ================= بوم =================
+st.subheader("بوم ترسیم")
+st.info("💡 با ابزار «میله» روی بوم کلیک کنید. با ابزار «تسمه» کلیک کرده و ماوس/انگشت را بکشید تا خطوط اتصال رسم شوند.")
+canvas_data = pattern_canvas()
+
+# استخراج داده‌ها
+rods = [obj for obj in canvas_data if obj['type'] == 'rod']
+wires = [obj for obj in canvas_data if obj['type'] == 'wire']
+
+col_info1, col_info2 = st.columns(2)
+col_info1.metric("تعداد میله‌های ترسیم شده", len(rods))
+col_info2.metric("طول کل تسمه‌ها (خطوط)", f"{len(wires)} خط")
+
+if len(rods) > 0:
+    # --- محاسبه فاصله‌ها ---
+    distances = []
+    min_spacing = 0
+    avg_spacing = 0
     
-    st.subheader("تنظیمات شبکه")
-    grid_pitch = st.number_input("فاصله هر خانه شبکه (متر)", value=3.0, min_value=0.5, step=0.5)
-
-# ================= بخش بوم (شبکه دکمه‌ها) =================
-st.subheader("۱. آرایش الکترودها را انتخاب کنید")
-st.info("روی مربع‌ها کلیک کنید تا الکترودها را (شبیه الگوی قفل گوشی) بچینید. هر مربع نماینده یک میله است.")
-
-# ذخیره وضعیت انتخاب‌ها در حافظه
-if 'grid_state' not in st.session_state:
-    # یک شبکه 4x4 (16 دکمه) ایجاد می‌کنیم
-    st.session_state.grid_state = [False] * 16
-
-# نمایش شبکه
-cols = st.columns(4)
-for i in range(16):
-    col_idx = i % 4
-    with cols[col_idx]:
-        # اگر انتخاب شده بود، رنگ دکمه را تغییر می‌دهیم
-        btn_label = "🟢" if st.session_state.grid_state[i] else "⚪"
-        if st.button(btn_label, key=f"btn_{i}", use_container_width=True):
-            st.session_state.grid_state[i] = not st.session_state.grid_state[i]
-            st.rerun() # رفرش سریع برای اعمال تغییرات
-
-# شمارش تعداد الکترودهای انتخاب شده
-n_rods = sum(st.session_state.grid_state)
-
-if n_rods > 0:
-    st.success(f"شما {n_rods} الکترود را انتخاب کرده‌اید.")
-    
-    # محاسبه فاصله متوسط بین میله‌ها بر اساس خانه‌های انتخاب شده
-    selected_indices = [i for i, val in enumerate(st.session_state.grid_state) if val]
-    spacing = grid_pitch # مقدار پیش‌فرض
-    
-    if n_rods > 1:
-        coords = [(i % 4, i // 4) for i in selected_indices]
-        distances = []
-        for i in range(len(coords)):
-            for j in range(i+1, len(coords)):
-                dist_grid = math.sqrt((coords[i][0] - coords[j][0])**2 + (coords[i][1] - coords[j][1])**2)
-                distances.append(dist_grid)
-        if distances:
-            avg_grid_dist = sum(distances) / len(distances)
-            spacing = max(avg_grid_dist * grid_pitch, 1.0) 
-            st.write(f"میانگین فاصله الکترودها بر اساس شبکه: {spacing:.2f} متر")
+    if len(rods) > 1:
+        # پیدا کردن نزدیک‌ترین همسایه برای هر میله
+        min_distances_per_rod = []
+        for i in range(len(rods)):
+            closest_dist = float('inf')
+            for j in range(len(rods)):
+                if i == j: continue
+                px_dist = math.sqrt((rods[i]['x'] - rods[j]['x'])**2 + (rods[i]['y'] - rods[j]['y'])**2)
+                m_dist = px_dist / pixels_per_meter
+                distances.append(m_dist)
+                if m_dist < closest_dist:
+                    closest_dist = m_dist
+            min_distances_per_rod.append(closest_dist)
+        
+        min_spacing = min(distances)
+        avg_spacing = sum(distances) / len(distances)
+        
+        st.write(f"🔹 میانگین فاصله میله‌ها: **{avg_spacing:.2f} متر**")
+        st.write(f"🔹 نزدیک‌ترین فاصله (s در فرمول): **{min_spacing:.2f} متر**")
 
     # ================= دکمه محاسبه =================
     if st.button("محاسبه مقاومت معادل", type="primary", use_container_width=True):
-        with st.spinner("در حال محاسبه..."):
-            results = calculate_equivalent_resistance(
-                rho=rho, rod_L=rod_L, rod_d=rod_d, n_rods=n_rods, spacing_m=spacing,
-                strip_L=strip_L if use_strip else 0,
-                strip_w=strip_w if use_strip else 0
-            )
-            
-            st.header("📊 نتایج")
-            col1, col2, col3 = st.columns(3)
-            
-            if results["R_rods"] > 0:
-                col1.metric("مقاومت میله‌ها", f"{results['R_rods']:.2f} Ω")
-            if results["R_strip"] > 0:
-                col2.metric("مقاومت نوار افقی", f"{results['R_strip']:.2f} Ω")
-            
-            col3.metric("مقاومت معادل کل", f"{results['R_eq']:.2f} Ω")
-            
-            if results["R_eq"] > 10:
-                st.warning("مقاومت بالای 10 اهم است. توصیه می‌شود تعداد الکترودها یا طول میله را افزایش دهید.")
-            else:
-                st.success("مقاومت در محدوده قابل قبول است.")
+        n = len(rods)
+        
+        # 1. محاسبه مقاومت میله‌ها (فرمول BS 7430)
+        if n == 1:
+            R_rods = (rho / (2 * math.pi * rod_L)) * (math.log(8 * rod_L / rod_d) - 1)
+        else:
+            # استفاده از فاصله نزدیک‌ترین میله برای فرمول موازی
+            s = max(min_spacing, 1.0) 
+            lambda_f = 2 * math.log((1.781 * n) / 2.718)
+            term = math.log(8 * rod_L / rod_d) - 1 + (lambda_f * rod_L / s)
+            R_rods = (rho / (2 * math.pi * rod_L * n)) * term
+
+        # 2. محاسبه مقاومت تسمه (اگر کشیده شده باشد)
+        total_wire_px = 0
+        for w in wires:
+            px_len = math.sqrt((w['x2'] - w['x1'])**2 + (w['y2'] - w['y1'])**2)
+            total_wire_px += px_len
+        
+        total_wire_m = total_wire_px / pixels_per_meter
+        R_wire = 0
+        
+        if total_wire_m > 0:
+            d_eq = 0.02 # فرض عرض تسمه 2 سانتی‌متر
+            R_wire = (rho / (2 * math.pi * total_wire_m)) * math.log((total_wire_m**2) / (1.85 * 0.6 * d_eq))
+
+        # 3. ترکیب نهایی (موازی)
+        if R_rods > 0 and R_wire > 0:
+            R_eq = (1 / ((1 / R_rods) + (1 / R_wire))) / 0.85 # ضریب اصلاح
+        else:
+            R_eq = R_rods if R_rods > 0 else R_wire
+
+        st.header("📊 نتایج محاسبات")
+        res_col1, res_col2, res_col3 = st.columns(3)
+        res_col1.metric("مقاومت میله‌ها", f"{R_rods:.2f} Ω")
+        if R_wire > 0:
+            res_col2.metric("مقاومت تسمه‌ها", f"{R_wire:.2f} Ω", help=f"طول کل: {total_wire_m:.1f} متر")
+        res_col3.metric("مقاومت معادل کل", f"{R_eq:.2f} Ω", delta_color="inverse")
+        
+        if R_eq <= 10:
+            st.success("✅ مقاومت سیستم زمین در محدوده مجاز (زیر ۱۰ اهم) است.")
+        else:
+            st.warning("⚠️ مقاومت بالاتر از ۱۰ اهم است. توصیه می‌شود طول میله‌ها یا تعداد آن‌ها را افزایش دهید.")
 
 else:
-    st.warning("لطفاً حداقل یک الکترود را روی بوم انتخاب کنید.")
+    st.info("برای شروع، با ابزار «میله» روی بوم کلیک کنید.")
