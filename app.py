@@ -81,12 +81,12 @@ if canvas_result.json_data is not None:
             else:
                 s = max(min(distances), 1.0) # استفاده از نزدیک‌ترین فاصله
                 lambda_f = 2 * math.log((1.781 * n) / 2.718)
-                term = = math.log(8 *  rod_L / rod0_d) - 1 + (lambda_f *
- rod_L / s)
+                term = math.log(8 * rod_L / rod_d) - 1 + (lambda_f * rod_L / s)
                 R_rods = (rho / (2 * math.pi * rod_L * n)) * term
 
             # 2. مقاومت تسمه (خطوط)
-            total_wire_px            for w in wires:
+            total_wire_px = 0
+            for w in wires:
                 # محاسبه طول خط با در نظر گرفتن چرخش
                 px_len = math.sqrt((w["x2"] - w["x1"])**2 + (w["y2"] - w["y1"])**2)
                 # اگر خط درگ شده باشد، فابریک طول را در scaleX ذخیره می‌کند
@@ -99,7 +99,12 @@ if canvas_result.json_data is not None:
             
             if total_wire_m > 0:
                 d_eq = strip_width_m / 2
-                R_wire = (rho / (2 * math.pi * total_wire_m)) * math.log((total_wire_m**2) / (1.85 * 0.6 * d_eq))
+                # جلوگیری از خطای لگاریتمی با بررسی مقدار
+                log_arg = (total_wire_m**2) / (1.85 * 0.6 * d_eq)
+                if log_arg > 1:
+                    R_wire = (rho / (2 * math.pi * total_wire_m)) * math.log(log_arg)
+                else:
+                    R_wire = (rho / (2 * math.pi * total_wire_m)) * math.log(1.1) # حداقل مقدار
 
             # 3. ترکیب نهایی
             if R_rods > 0 and R_wire > 0:
